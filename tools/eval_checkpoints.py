@@ -24,6 +24,7 @@ Usage:
 
 import os
 import sys
+import contextlib
 import glob
 import pickle
 import random
@@ -384,7 +385,47 @@ def eval_autoattack(norm_model, loader, device, eps_01, norm="Linf", version="st
     all_y = torch.cat(all_y).to(device)
 
     adversary = AutoAttack(norm_model, norm=norm, eps=eps_01, version=version, verbose=True)
-    x_adv = adversary.run_standard_evaluation(all_x, all_y, bs=batch_size)
+
+    num_classes = int(all_y.max().item()) + 1
+    if num_classes < 4:
+        adversary.attacks_to_run = ["apgd-ce", "square"]
+        print(f"  [AutoAttack] {num_classes} classes: using apgd-ce + square only (DLR needs >=4 classes)")
+
+    import io
+
+    _captured = io.StringIO()
+    with contextlib.redirect_stdout(_captured), contextlib.redirect_stderr(_captured):
+        x_adv = adversary.run_standard_evaluation(all_x, all_y, bs=batch_size)
+    aa_output = _captured.getvalue()
+    print(aa_output, end="")
+
+    def _aa_sanitize(name: str) -> str:
+        # W&B / chart search: avoid deep paths with hyphens (APGD-T hard to find)
+        return re.sub(r"[^A-Za-z0-9]+", "_", name.strip()).strip("_").lower()
+
+    results = {}
+    # Locale-safe: 41.45% or 41,45%; also tolerate spaces before %
+    _pat = re.compile(
+        r"robust accuracy after\s+([^:\n]+?):\s*([\d.,]+)\s*%",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    for m in _pat.finditer(aa_output):
+        atk_raw = m.group(1).strip()
+        num_s = m.group(2).strip().replace(",", ".")
+        try:
+            pct = float(num_s)
+            rob_acc = pct / 100.0 if pct > 1.0 else pct
+            rob_acc = min(max(rob_acc, 0.0), 1.0)
+        except ValueError:
+            continue
+        key = _aa_sanitize(atk_raw)
+        if not key:
+            continue
+        results[f"{key}/Acc"] = rob_acc
+        results[f"{key}/Error"] = 1.0 - rob_acc
+
+    if not any("/" in k for k in results):
+        print("  [WARN] AutoAttack: no per-step lines matched; expected 'robust accuracy after …: xx.xx%'")
 
     with torch.no_grad():
         total_err, n = 0, 0
@@ -393,7 +434,9 @@ def eval_autoattack(norm_model, loader, device, eps_01, norm="Linf", version="st
             total_err += (norm_model(xb).argmax(1) != yb).sum().item()
             n += len(yb)
     err = total_err / n
-    return {"Error": err, "Acc": 1.0 - err}
+    results["Error"] = err
+    results["Acc"] = 1.0 - err
+    return results
 
 
 def eval_corruption(norm_model, device, dataset_name, corruption, severity, batch_size=64):
@@ -603,6 +646,15 @@ def find_checkpoints(ckpt_dir, pattern="*_epoch*.pt"):
     return result
 
 
+def _maybe_last_ckpt_only(ckpts, last_ckpt_only: bool):
+    """If True, keep only the highest-epoch checkpoint (final training state)."""
+    if not last_ckpt_only or len(ckpts) <= 1:
+        return ckpts
+    ep, path = ckpts[-1]
+    print(f"[eval] last_ckpt_only: using epoch {ep} only ({os.path.basename(path)})")
+    return [ckpts[-1]]
+
+
 def resolve_via_slurm_log(slurm_logs_dir, array_job, task):
     log_path = os.path.join(slurm_logs_dir, f"slurm_cegs_{array_job}_{task}.out")
     if not os.path.isfile(log_path):
@@ -715,6 +767,7 @@ def args_from_tsv(conf_path, idx):
         ckpt=None, ckpt_dir=_g(hp, "ckpt_dir") or None,
         runs_dir=runs_dir, slurm_logs_dir=slurm_logs_dir,
         pattern=_g(hp, "pattern", "*_epoch*.pt"),
+        last_ckpt_only=_g(hp, "last_ckpt_only", "false").lower() in ("1", "true", "yes"),
         dataset=_g(hp, "dataset") or None,
         device="cuda", batch_size=int(_g(hp, "batch_size", "64")),
         attacks=_g(hp, "attacks", "fgsm,pgd_linf,pgd_linf_rs"),
@@ -761,6 +814,10 @@ def run_eval(args):
     if not ckpts:
         print("No checkpoints found."); return
 
+    ckpts = _maybe_last_ckpt_only(ckpts, bool(getattr(args, "last_ckpt_only", False)))
+    if not ckpts:
+        print("No checkpoints found."); return
+
     ds = args.dataset or detect_dataset(ckpts[0][1])
     if not ds:
         print("Cannot detect dataset."); return
@@ -771,7 +828,16 @@ def run_eval(args):
     norm_model = NormalizeModel(raw_model, mean, std).to(device)
 
     test_loader, _ = build_test_loader(ds, batch_size=args.batch_size)
-    print(f"Dataset: {ds}  |  Checkpoints: {len(ckpts)}  |  Device: {device}")
+    print(
+        f"Dataset: {ds}  |  Checkpoints: {len(ckpts)}  |  "
+        f"last_ckpt_only: {bool(getattr(args, 'last_ckpt_only', False))}  |  Device: {device}"
+    )
+    aa_on = getattr(args, "autoattack", "").strip().lower() in (
+        "1", "true", "yes", "linf", "l2", "both")
+    if aa_on and len(ckpts) > 1 and not bool(getattr(args, "last_ckpt_only", False)):
+        print("  [WARN] AutoAttack + multiple checkpoints + last_ckpt_only=False: "
+              "W&B logs one point per epoch. Set last_ckpt_only=True in the TSV or --last_ckpt_only "
+              "to evaluate only the final *_epoch*.pt.")
     print(f"Normalization: mean={mean}  std={std}")
 
     attacks = [a.strip() for a in args.attacks.split(",") if a.strip()] if args.attacks else []
@@ -926,6 +992,8 @@ def main():
     p.add_argument("--runs_dir", type=str, default=DEFAULT_RUNS_DIR)
     p.add_argument("--slurm_logs_dir", type=str, default="")
     p.add_argument("--pattern", type=str, default="*_epoch*.pt")
+    p.add_argument("--last_ckpt_only", action="store_true",
+                   help="Only evaluate the highest-epoch *_epoch*.pt (ignore intermediate checkpoints)")
     p.add_argument("--dataset", type=str, choices=list(DATASET_STATS.keys()))
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--batch_size", type=int, default=64)
